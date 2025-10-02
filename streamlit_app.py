@@ -208,7 +208,6 @@ def section_status_overview(snapshots: pd.DataFrame):
                 piv = hist.pivot_table(index="timestamp", columns="nominee", values="votes", aggfunc="last").sort_index()
                 st.line_chart(piv)
 
-
 def section_submit_predictions(nominees: Dict[str, List[str]]):
     st.header("📝 Afgiv dine gæt (låses efter indsendelse)")
     participant = st.session_state.get("participant")
@@ -219,6 +218,7 @@ def section_submit_predictions(nominees: Dict[str, List[str]]):
     st.success(f"Logget ind som: {participant}")
     preds = read_predictions()
 
+    # Allerede indsendt pr. kategori for denne deltager
     already = set(preds[preds["participant"] == participant]["category"].unique())
     remaining = [c for c in CATEGORIES if c not in already]
 
@@ -227,53 +227,52 @@ def section_submit_predictions(nominees: Dict[str, List[str]]):
         st.dataframe(preds[preds["participant"] == participant], use_container_width=True)
         return
 
-with st.form("pred_form"):
-    picks = {}
-    for cat in remaining:
-        st.subheader(cat)
-        options = nominees.get(cat, [])
-        if not options:
-            st.warning("Ingen kandidater i denne kategori endnu – prøv igen senere.")
-            continue
+    with st.form("pred_form"):
+        picks = {}
+        for cat in remaining:
+            st.subheader(cat)
+            options = nominees.get(cat, [])
+            if not options:
+                st.warning("Ingen kandidater i denne kategori endnu – prøv igen senere.")
+                continue
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            p1 = st.selectbox(f"🏆 Vinder – {cat}", options, key=f"p1_{cat}")
-        with c2:
-            p2 = st.selectbox(f"Runnerup – {cat}", options, key=f"p2_{cat}")
-        with c3:
-            p3 = st.selectbox(f"Taber – {cat}", options, key=f"p3_{cat}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                p1 = st.selectbox("🏆 Vinder", options, key=f"p1_{participant}_{cat}")
+            with c2:
+                p2 = st.selectbox("🥈 Runnerup", options, key=f"p2_{participant}_{cat}")
+            with c3:
+                p3 = st.selectbox("🥉 Taber", options, key=f"p3_{participant}_{cat}")
 
-        # Sikr at de tre valg er forskellige
-        if len({p1, p2, p3}) < 3:
-            st.error("Vælg tre forskellige kandidater pr. kategori.")
+            # Sikr at de tre valg er forskellige
+            if len({p1, p2, p3}) < 3:
+                st.error("Vælg tre forskellige kandidater pr. kategori.")
+            else:
+                picks[cat] = (p1, p2, p3)
 
-        picks[cat] = (p1, p2, p3)
-
-    submitted = st.form_submit_button("Indsend og lås mine gæt")
-
+        submitted = st.form_submit_button("Indsend og lås mine gæt")
 
     if submitted:
+        if not picks:
+            st.warning("Intet gemt – tjek at der findes kandidater og at valg er forskellige.")
+            return
+
         rows = []
         now = datetime.now().isoformat()
         for cat, (p1, p2, p3) in picks.items():
-            if p1 and p2 and p3 and len({p1, p2, p3}) == 3:
-                rows.append({
-                    "participant": participant,
-                    "category": cat,
-                    "pick1": p1,
-                    "pick2": p2,
-                    "pick3": p3,
-                    "submitted_at": now,
-                })
-        if rows:
-            new_df = pd.DataFrame(rows)
-            out = pd.concat([read_predictions(), new_df], ignore_index=True)
-            write_predictions(out)
-            st.success("Dine gæt er gemt og låst for de valgte kategorier ✨")
-        else:
-            st.warning("Intet gemt – tjek at der findes kandidater og at valg er forskellige.")
+            rows.append({
+                "participant": participant,
+                "category": cat,
+                "pick1": p1,
+                "pick2": p2,
+                "pick3": p3,
+                "submitted_at": now,
+            })
 
+        new_df = pd.DataFrame(rows)
+        out = pd.concat([read_predictions(), new_df], ignore_index=True)
+        write_predictions(out)
+        st.success("Dine gæt er gemt og låst for de valgte kategorier ✨")
 
 def section_leaderboard(snapshots: pd.DataFrame):
     st.header("🏆 Leaderboard – potentielle point (live)")
