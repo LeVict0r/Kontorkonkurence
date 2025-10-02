@@ -227,25 +227,31 @@ def section_submit_predictions(nominees: Dict[str, List[str]]):
         st.dataframe(preds[preds["participant"] == participant], use_container_width=True)
         return
 
-    with st.form("pred_form"):
-        picks = {}
-        for cat in remaining:
-            st.subheader(cat)
-            options = nominees.get(cat, [])
-            if not options:
-                st.warning("Ingen kandidater i denne kategori endnu – prøv igen senere.")
-                continue
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                p1 = st.selectbox(f"1. plads – {cat}", options, key=f"p1_{cat}")
-            with c2:
-                p2 = st.selectbox(f"2. plads – {cat}", options, key=f"p2_{cat}")
-            with c3:
-                p3 = st.selectbox(f"3. plads – {cat}", options, key=f"p3_{cat}")
-            if len({p1, p2, p3}) < 3:
-                st.error("Vælg tre forskellige kandidater pr. kategori.")
-            picks[cat] = (p1, p2, p3)
-        submitted = st.form_submit_button("Indsend og lås mine gæt")
+with st.form("pred_form"):
+    picks = {}
+    for cat in remaining:
+        st.subheader(cat)
+        options = nominees.get(cat, [])
+        if not options:
+            st.warning("Ingen kandidater i denne kategori endnu – prøv igen senere.")
+            continue
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            p1 = st.selectbox(f"🏆 Vinder – {cat}", options, key=f"p1_{cat}")
+        with c2:
+            p2 = st.selectbox(f"Runnerup – {cat}", options, key=f"p2_{cat}")
+        with c3:
+            p3 = st.selectbox(f"Taber – {cat}", options, key=f"p3_{cat}")
+
+        # Sikr at de tre valg er forskellige
+        if len({p1, p2, p3}) < 3:
+            st.error("Vælg tre forskellige kandidater pr. kategori.")
+
+        picks[cat] = (p1, p2, p3)
+
+    submitted = st.form_submit_button("Indsend og lås mine gæt")
+
 
     if submitted:
         rows = []
