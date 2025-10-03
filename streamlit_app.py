@@ -593,6 +593,34 @@ def section_admin(nominees: Dict[str, List[str]]):
             st.success(f"Gæt for {who} er nulstillet.")
 
     st.divider()
+with st.expander("🔌 Sundhedstjek – Google Sheets"):
+    st.write("SPREADSHEET_ID:", _secret("SPREADSHEET_ID"))
+    has_svc = False
+    try:
+        _ = st.secrets["gcp_service_account"]
+        has_svc = True
+    except Exception:
+        pass
+    st.write("Service account i Secrets:", "✅" if has_svc else "❌")
+
+    if st.button("Kør tjek nu"):
+        try:
+            client, sh = _get_gspread()
+            st.success(f"Forbundet til Google Sheets: {sh.title}")
+            ws = _ensure_ws("nominees", ["category","nominee"])
+            rows_before = len(ws.get_all_values())
+            # Skriv en test-række og slet den igen
+            marker = "DIAG_" + datetime.now().strftime("%H%M%S")
+            ws.append_row(["__diagnostic__", marker], value_input_option="RAW")
+            rows_after = len(ws.get_all_values())
+            st.write("Rækker før:", rows_before, "Rækker efter:", rows_after)
+            # slet sidste række igen
+            ws.delete_rows(rows_after)
+            st.success("Skriv/læs OK ✅ (test-række skrevet og fjernet)")
+        except Exception as e:
+            st.error("Google Sheets-fejl – kunne ikke læse/skrive.")
+            st.exception(e)
+            st.info("Tjek: deling (Editor), SPREADSHEET_ID, og at private_key står med triple quotes i Secrets.")
 
     # Eksport
     st.subheader("Eksport")
