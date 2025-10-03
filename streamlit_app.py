@@ -1,7 +1,7 @@
 # streamlit_app.py
 # ---------------------------------------------------------------
 # Erhvervskulturpriserne 2025 – Kontorspil
-# Persistent storage: Google Sheets (hvis Secrets er sat) ellers lokale filer
+# Persistent storage: Google Sheets (hvis konfigureret) ellers lokale filer
 # Jury (60%) + Offentlig (40%), historik, predictions & leaderboard
 # ---------------------------------------------------------------
 
@@ -29,6 +29,7 @@ PREDICTIONS_CSV = os.path.join(DATA_DIR, "predictions.csv")
 SNAPSHOTS_CSV  = os.path.join(DATA_DIR, "snapshots.csv")
 NOMINEES_JSON  = os.path.join(DATA_DIR, "nominees.json")
 JURY_CSV       = os.path.join(DATA_DIR, "jury.csv")
+CONFIG_JSON    = os.path.join(DATA_DIR, "config.json")  # her kan vi gemme SPREADSHEET_ID via UI
 
 GSPREAD_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -65,50 +66,102 @@ PARTICIPANT_CODES = {
 
 COMPETITION_END = date(2025, 10, 26)
 
+# ---------- Lokal config (til at gemme Sheet ID via UI) ----------
+def _read_config() -> Dict[str, str]:
+    try:
+        if os.path.exists(CONFIG_JSON):
+            with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+                if isinstance(obj, dict):
+                    return obj
+    except Exception:
+        pass
+    return {}
+
+def _write_config(d: Dict[str, str]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_JSON, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
 # ---------- Google Sheets: robust ID-hentning ----------
-def _get_spreadsheet_id() -> Optional[str]:
+def _resolve_spreadsheet_id_with_source() -> Tuple[Optional[str], str]:
     """
-    Returnér SPREADSHEET_ID fra Secrets.
-    Fallback: hvis nogen har lagt ID'et inde i [gcp_service_account]-blokken, fanges det også.
+    Finder SPREADSHEET_ID med klar prioritet og returnerer (id, kilde).
+    Kilder i prioriteret rækkefølge:
+      1) st.session_state["SPREADSHEET_ID_OVERRIDE"]
+      2) data/config.json
+      3) st.secrets["SPREADSHEET_ID"]
+      4) st.secrets["gcp_service_account"]["SPREADSHEET_ID"]
+      5) os.environ["SPREADSHEET_ID"]
     """
-    sid = None
+    # 1) session override
+    sid = st.session_state.get("SPREADSHEET_ID_OVERRIDE")
+    if sid:
+        return sid.strip(), "session_state"
+
+    # 2) lokal config
+    cfg = _read_config()
+    sid = cfg.get("SPREADSHEET_ID")
+    if sid:
+        return sid.strip(), "config.json"
+
+    # 3) secrets topniveau
     try:
         sid = st.secrets.get("SPREADSHEET_ID", None)
+        if sid:
+            return str(sid).strip(), "secrets_top"
     except Exception:
-        sid = None
-    if not sid:
-        try:
-            svc = st.secrets.get("gcp_service_account", None)
-            if isinstance(svc, dict):
-                sid = svc.get("SPREADSHEET_ID", None)
-        except Exception:
-            sid = None
-    sid = (sid or "").strip()
-    return sid if sid else None
+        pass
 
-# ---------- Vælg storage-backend ----------
+    # 4) secrets inde i gcp_service_account
+    try:
+        svc = st.secrets.get("gcp_service_account", None)
+        if isinstance(svc, dict):
+            sid = svc.get("SPREADSHEET_ID", None)
+            if sid:
+                return str(sid).strip(), "secrets_gcp_block"
+    except Exception:
+        pass
+
+    # 5) miljøvariabel
+    sid = os.environ.get("SPREADSHEET_ID")
+    if sid:
+        return sid.strip(), "env"
+
+    return None, "none"
+
+def _get_spreadsheet_id() -> Optional[str]:
+    sid, _ = _resolve_spreadsheet_id_with_source()
+    return sid
+
 def _sheets_available() -> bool:
     try:
         svc = st.secrets.get("gcp_service_account", None)
-        sid = _get_spreadsheet_id()
-        return bool(svc and sid)
     except Exception:
-        return False
+        svc = None
+    sid = _get_spreadsheet_id()
+    return bool(svc and sid)
 
-USE_SHEETS = _sheets_available()
+def use_sheets() -> bool:
+    """Kald denne i stedet for en global konstant, så vi kan skifte on-the-fly."""
+    return _sheets_available()
 
 # ---------- Google Sheets helpers ----------
 def _get_gspread() -> Tuple["gspread.client.Client", "gspread.Spreadsheet"]:
     import gspread
     from google.oauth2.service_account import Credentials
 
-    svc = st.secrets.get("gcp_service_account", None)
+    try:
+        svc = st.secrets.get("gcp_service_account", None)
+    except Exception:
+        svc = None
+
     sid = _get_spreadsheet_id()
 
     if not svc:
         raise RuntimeError("Google Sheets er ikke konfigureret: mangler [gcp_service_account] i Secrets.")
     if not sid:
-        raise RuntimeError("Google Sheets er ikke konfigureret: mangler SPREADSHEET_ID i Secrets (toplevel eller i gcp_service_account).")
+        raise RuntimeError("Google Sheets er ikke konfigureret: mangler SPREADSHEET_ID i Secrets/UI (toplevel, i gcp_service_account, config.json eller session).")
 
     creds = Credentials.from_service_account_info(svc, scopes=GSPREAD_SCOPES)
     client = gspread.authorize(creds)
@@ -155,7 +208,7 @@ def _ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
 
 # ---------- Storage API ----------
 def ensure_storage():
-    if USE_SHEETS:
+    if use_sheets():
         _ensure_ws("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
         _ensure_ws("snapshots",   ["batch_id","timestamp","category","nominee","votes"])
         _ensure_ws("jury",        ["category","nominee","jury_pct","updated_at"])
@@ -173,7 +226,7 @@ def ensure_storage():
             pd.DataFrame(columns=["category","nominee","jury_pct","updated_at"]).to_csv(JURY_CSV, index=False)
 
 def load_nominees() -> Dict[str, List[str]]:
-    if USE_SHEETS:
+    if use_sheets():
         df = _ws_to_df("nominees", ["category","nominee"])
         out = {cat: [] for cat in CATEGORIES}
         for cat in CATEGORIES:
@@ -184,7 +237,7 @@ def load_nominees() -> Dict[str, List[str]]:
             return json.load(f)
 
 def save_nominees(nominees: Dict[str, List[str]]):
-    if USE_SHEETS:
+    if use_sheets():
         rows = []
         for cat, arr in nominees.items():
             for nom in arr:
@@ -196,7 +249,7 @@ def save_nominees(nominees: Dict[str, List[str]]):
             json.dump(nominees, f, ensure_ascii=False, indent=2)
 
 def read_predictions() -> pd.DataFrame:
-    if USE_SHEETS:
+    if use_sheets():
         return _ws_to_df("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
     else:
         if os.path.exists(PREDICTIONS_CSV):
@@ -204,13 +257,13 @@ def read_predictions() -> pd.DataFrame:
         return pd.DataFrame(columns=["participant","category","pick1","pick2","pick3","submitted_at"])
 
 def write_predictions(df: pd.DataFrame):
-    if USE_SHEETS:
+    if use_sheets():
         _df_to_ws("predictions", df, ["participant","category","pick1","pick2","pick3","submitted_at"])
     else:
         df.to_csv(PREDICTIONS_CSV, index=False)
 
 def read_snapshots() -> pd.DataFrame:
-    if USE_SHEETS:
+    if use_sheets():
         df = _ws_to_df("snapshots", ["batch_id","timestamp","category","nominee","votes"])
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -226,7 +279,7 @@ def read_snapshots() -> pd.DataFrame:
 def write_snapshots(df: pd.DataFrame):
     if not df.empty:
         df = df.sort_values(["timestamp","batch_id"], ascending=[False, False])
-    if USE_SHEETS:
+    if use_sheets():
         tmp = df.copy()
         if "timestamp" in tmp.columns:
             tmp["timestamp"] = tmp["timestamp"].astype(str)
@@ -235,7 +288,7 @@ def write_snapshots(df: pd.DataFrame):
         df.to_csv(SNAPSHOTS_CSV, index=False)
 
 def read_jury() -> pd.DataFrame:
-    if USE_SHEETS:
+    if use_sheets():
         return _ws_to_df("jury", ["category","nominee","jury_pct","updated_at"])
     else:
         if os.path.exists(JURY_CSV):
@@ -243,7 +296,7 @@ def read_jury() -> pd.DataFrame:
         return pd.DataFrame(columns=["category","nominee","jury_pct","updated_at"])
 
 def write_jury(df: pd.DataFrame):
-    if USE_SHEETS:
+    if use_sheets():
         _df_to_ws("jury", df, ["category","nominee","jury_pct","updated_at"])
     else:
         df.to_csv(JURY_CSV, index=False)
@@ -460,6 +513,31 @@ def section_leaderboard(snapshots: pd.DataFrame):
 def section_admin(nominees: Dict[str, List[str]]):
     st.header("🔧 Admin – kandidater, jury & snapshots")
 
+    # ⚙️ Konfiguration – sæt/vis Spreadsheet ID
+    with st.expander("⚙️ Konfiguration"):
+        sid, src = _resolve_spreadsheet_id_with_source()
+        st.write("Aktuel SPREADSHEET_ID:", sid or "None")
+        st.write("Kilde:", src)
+        new_sid = st.text_input("Angiv/ret Google Sheet ID", value=sid or "", help="Selve ID'et fra URL'en mellem /d/ og /edit")
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Gem ID til config.json"):
+                cfg = _read_config()
+                cfg["SPREADSHEET_ID"] = new_sid.strip()
+                _write_config(cfg)
+                st.session_state["SPREADSHEET_ID_OVERRIDE"] = new_sid.strip()
+                st.success("SPREADSHEET_ID gemt lokalt og aktiveret for denne session.")
+        with colB:
+            if st.button("Ryd lokalt ID"):
+                cfg = _read_config()
+                if "SPREADSHEET_ID" in cfg:
+                    del cfg["SPREADSHEET_ID"]
+                    _write_config(cfg)
+                st.session_state.pop("SPREADSHEET_ID_OVERRIDE", None)
+                st.success("Lokalt ID ryddet. Appen vil nu bruge Secrets eller ENV hvis tilgængeligt.")
+
+        st.caption("Tip: Når ID'et er sat her, kan du bruge Sheets med det samme – selv hvis Secrets driller.")
+
     # Kandidater
     st.subheader("Kandidater pr. kategori")
     with st.form("nominees_form"):
@@ -582,8 +660,10 @@ def section_admin(nominees: Dict[str, List[str]]):
 
     # 🔌 Sundhedstjek – Google Sheets
     with st.expander("🔌 Sundhedstjek – Google Sheets"):
-        st.write("Lagring valgt:", "Google Sheets" if USE_SHEETS else "Lokale filer")
-        st.write("SPREADSHEET_ID:", _get_spreadsheet_id())
+        sid, src = _resolve_spreadsheet_id_with_source()
+        st.write("Lagring valgt:", "Google Sheets" if use_sheets() else "Lokale filer")
+        st.write("SPREADSHEET_ID (opdaget):", sid or "None")
+        st.write("Kilde:", src)
         has_svc = st.secrets.get("gcp_service_account", None) is not None
         st.write("Service account i Secrets:", "✅" if has_svc else "❌")
 
@@ -602,7 +682,7 @@ def section_admin(nominees: Dict[str, List[str]]):
             except Exception as e:
                 st.error("Google Sheets-fejl – kunne ikke læse/skrive.")
                 st.exception(e)
-                st.info("Tjek: deling (Editor), SPREADSHEET_ID i Secrets, og private_key i triple quotes.")
+                st.info("Tjek: deling (Editor), SPREADSHEET_ID (UI/Secrets), og private_key i triple quotes.")
 
     st.divider()
 
@@ -632,7 +712,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     ensure_storage()
     st.title(APP_TITLE)
-    st.caption(f"Lagring: {'Google Sheets' if USE_SHEETS else 'Lokale filer'}")
+    st.caption(f"Lagring: {'Google Sheets' if use_sheets() else 'Lokale filer'}")
 
     c1, c2, c3 = st.columns([2,1,1])
     with c1:
