@@ -683,45 +683,72 @@ def section_admin(nominees: Dict[str, List[str]]):
 
     st.divider()
 
-    # Snapshots (offentlig 40%)
+     # Snapshots (offentlig 40%)
     st.subheader("Tilføj snapshot (offentlige stemmer – vægt 40%)")
     st.caption("Et snapshot er de aktuelle, samlede offentlige stemmetal pr. kandidat. Hver tilføjelse gemmes som historik.")
-    snapshots = read_snapshots()
-    snap_date = st.date_input("Dato for snapshot", value=date.today())
-    batch_id = f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    entries = []
-    valid = True
-    for cat in CATEGORIES:
-        st.markdown(f"**{cat}**")
-        opts = nominees.get(cat, [])
-        if not opts:
-            st.warning("Ingen kandidater i denne kategori – tilføj dem ovenfor og gem først.")
-            valid = False
-            continue
-        cols = st.columns(3)
-        for i, nom in enumerate(opts):
-            idx = i % 3
-            with cols[idx]:
-                val = st.number_input(f"{nom}", min_value=0, step=1, value=0, key=f"{batch_id}_{cat}_{nom}")
-                entries.append({
-                    "batch_id": batch_id,
-                    "timestamp": datetime.combine(snap_date, datetime.now().time()).isoformat(),
-                    "category": cat,
-                    "nominee": nom,
-                    "votes": int(val),
-                })
+    # Stabilt snapshot-id pr. "runde" – må først ændres efter gem
+    if "snapshot_id" not in st.session_state:
+        st.session_state["snapshot_id"] = f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    if st.button("Gem snapshot"):
+    # Husk valgt dato på tværs af reruns
+    if "snap_date" not in st.session_state:
+        st.session_state["snap_date"] = date.today()
+
+    # Brug en form, så reruns ikke smider inputs
+    with st.form("snapshot_form", clear_on_submit=False):
+        st.session_state["snap_date"] = st.date_input("Dato for snapshot", value=st.session_state["snap_date"])
+
+        valid = True
+        # Inputfelter med STABILE keys: votes_{kategori}_{nominee}
+        for cat in CATEGORIES:
+            st.markdown(f"**{cat}**")
+            opts = nominees.get(cat, [])
+            if not opts:
+                st.warning("Ingen kandidater i denne kategori – tilføj dem ovenfor og gem først.")
+                valid = False
+                continue
+
+            cols = st.columns(3)
+            for i, nom in enumerate(opts):
+                idx = i % 3
+                key = f"votes_{cat}_{nom}"
+                with cols[idx]:
+                    # Første gang er value=0, derefter bevares state via key
+                    st.number_input(f"{nom}", min_value=0, step=1, key=key)
+
+        submitted = st.form_submit_button("Gem snapshot")
+
+    if submitted:
         if not valid:
             st.error("Kan ikke gemme: manglende kandidater i mindst én kategori.")
         else:
-            df_new = pd.DataFrame(entries)
-            out = pd.concat([snapshots, df_new], ignore_index=True)
-            write_snapshots(out)
-            st.success("Snapshot gemt.")
+            # Byg rækker ud fra state
+            entries = []
+            snap_dt = datetime.combine(st.session_state["snap_date"], datetime.now().time()).isoformat()
+            for cat in CATEGORIES:
+                for nom in nominees.get(cat, []):
+                    key = f"votes_{cat}_{nom}"
+                    val = int(st.session_state.get(key, 0) or 0)
+                    entries.append({
+                        "batch_id": st.session_state["snapshot_id"],
+                        "timestamp": snap_dt,
+                        "category": cat,
+                        "nominee": nom,
+                        "votes": val,
+                    })
 
-    st.divider()
+            old = read_snapshots()
+            df_new = pd.DataFrame(entries)
+            out = pd.concat([old, df_new], ignore_index=True)
+            write_snapshots(out)  # rydder cache i vores write_*-funktion
+
+            st.success("Snapshot gemt.")
+            # Klargør til næste runde: nyt id og nulstil kun vote-felter
+            st.session_state["snapshot_id"] = f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            for k in list(st.session_state.keys()):
+                if k.startswith("votes_"):
+                    st.session_state.pop(k, None)
 
     # 🔌 Sundhedstjek – Google Sheets
     with st.expander("🔌 Sundhedstjek – Google Sheets"):
