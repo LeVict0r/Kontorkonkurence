@@ -606,7 +606,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     ensure_storage()
     st.title(APP_TITLE)
-    st.caption("Data gemmes i Google Sheets (hvis sat op) eller lokalt i ./data/")
+    st.caption(f"Lagring: {'Google Sheets' if USE_SHEETS else 'Lokale filer'}")
 
     c1, c2, c3 = st.columns([2,1,1])
     with c1:
