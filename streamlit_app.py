@@ -65,12 +65,33 @@ PARTICIPANT_CODES = {
 
 COMPETITION_END = date(2025, 10, 26)
 
+# ---------- Google Sheets: robust ID-hentning ----------
+def _get_spreadsheet_id() -> Optional[str]:
+    """
+    Returnér SPREADSHEET_ID fra Secrets.
+    Fallback: hvis nogen har lagt ID'et inde i [gcp_service_account]-blokken, fanges det også.
+    """
+    sid = None
+    try:
+        sid = st.secrets.get("SPREADSHEET_ID", None)
+    except Exception:
+        sid = None
+    if not sid:
+        try:
+            svc = st.secrets.get("gcp_service_account", None)
+            if isinstance(svc, dict):
+                sid = svc.get("SPREADSHEET_ID", None)
+        except Exception:
+            sid = None
+    sid = (sid or "").strip()
+    return sid if sid else None
+
 # ---------- Vælg storage-backend ----------
 def _sheets_available() -> bool:
     try:
-        sid = st.secrets.get("SPREADSHEET_ID", None)
         svc = st.secrets.get("gcp_service_account", None)
-        return bool(sid and svc)
+        sid = _get_spreadsheet_id()
+        return bool(svc and sid)
     except Exception:
         return False
 
@@ -82,15 +103,16 @@ def _get_gspread() -> Tuple["gspread.client.Client", "gspread.Spreadsheet"]:
     from google.oauth2.service_account import Credentials
 
     svc = st.secrets.get("gcp_service_account", None)
-    sid = st.secrets.get("SPREADSHEET_ID", None)
-    if not svc or not sid:
-        raise RuntimeError(
-            "Google Sheets er ikke konfigureret: Mangler gcp_service_account og/eller SPREADSHEET_ID i Secrets."
-        )
+    sid = _get_spreadsheet_id()
+
+    if not svc:
+        raise RuntimeError("Google Sheets er ikke konfigureret: mangler [gcp_service_account] i Secrets.")
+    if not sid:
+        raise RuntimeError("Google Sheets er ikke konfigureret: mangler SPREADSHEET_ID i Secrets (toplevel eller i gcp_service_account).")
 
     creds = Credentials.from_service_account_info(svc, scopes=GSPREAD_SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(sid)
+    sheet = client.open_by_key(str(sid))
     return client, sheet
 
 def _ensure_ws(name: str, header: List[str]):
@@ -561,7 +583,7 @@ def section_admin(nominees: Dict[str, List[str]]):
     # 🔌 Sundhedstjek – Google Sheets
     with st.expander("🔌 Sundhedstjek – Google Sheets"):
         st.write("Lagring valgt:", "Google Sheets" if USE_SHEETS else "Lokale filer")
-        st.write("SPREADSHEET_ID:", st.secrets.get("SPREADSHEET_ID", None))
+        st.write("SPREADSHEET_ID:", _get_spreadsheet_id())
         has_svc = st.secrets.get("gcp_service_account", None) is not None
         st.write("Service account i Secrets:", "✅" if has_svc else "❌")
 
