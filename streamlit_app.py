@@ -1,8 +1,14 @@
+# streamlit_app.py
+# ---------------------------------------------------------------
+# Erhvervskulturpriserne 2025 – Kontorspil
+# Persistent storage: Google Sheets (hvis Secrets er sat) ellers lokale filer
+# Jury (60%) + Offentlig (40%), historik, predictions & leaderboard
+# ---------------------------------------------------------------
 
 import os
 import json
 from datetime import datetime, date
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -17,17 +23,15 @@ except Exception:
 # ---------- Konfiguration ----------
 APP_TITLE = "Erhvervskulturpriserne 2025 – Kontorspil"
 
-# Fallback fil-baseret
+# Lokalt fallback
 DATA_DIR = os.environ.get("EKP_DATA_DIR", "data")
 PREDICTIONS_CSV = os.path.join(DATA_DIR, "predictions.csv")
 SNAPSHOTS_CSV  = os.path.join(DATA_DIR, "snapshots.csv")
 NOMINEES_JSON  = os.path.join(DATA_DIR, "nominees.json")
 JURY_CSV       = os.path.join(DATA_DIR, "jury.csv")
 
-# Google Sheets (auto-detekteres via Secrets)
 GSPREAD_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Faste kategorier
 CATEGORIES: List[str] = [
     "Årets Leder",
     "Årets Talent",
@@ -37,8 +41,6 @@ CATEGORIES: List[str] = [
     "Innovationsprisen",
     "Årets Virksomhed",
 ]
-
-# Faste deltagere
 PARTICIPANTS: List[str] = ["Kristina", "Jan", "Victor", "Sara", "Mette", "Peter"]
 
 def _secret(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -66,33 +68,30 @@ COMPETITION_END = date(2025, 10, 26)
 # ---------- Vælg storage-backend ----------
 def _sheets_available() -> bool:
     try:
-        sid = _secret("SPREADSHEET_ID")
+        sid = st.secrets.get("SPREADSHEET_ID", None)
         svc = st.secrets.get("gcp_service_account", None)
-        if sid and svc:
-            return True
+        return bool(sid and svc)
     except Exception:
-        pass
-    return False
+        return False
 
 USE_SHEETS = _sheets_available()
 
 # ---------- Google Sheets helpers ----------
-_gspread_client = None
-_gspread_sheet  = None
-
-def _get_gspread():
-    global _gspread_client, _gspread_sheet
-    if _gspread_client is not None and _gspread_sheet is not None:
-        return _gspread_client, _gspread_sheet
-
+def _get_gspread() -> Tuple["gspread.client.Client", "gspread.Spreadsheet"]:
     import gspread
     from google.oauth2.service_account import Credentials
 
-    svc_info = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(svc_info, scopes=GSPREAD_SCOPES)
-    _gspread_client = gspread.authorize(creds)
-    _gspread_sheet = _gspread_client.open_by_key(st.secrets["SPREADSHEET_ID"])
-    return _gspread_client, _gspread_sheet
+    svc = st.secrets.get("gcp_service_account", None)
+    sid = st.secrets.get("SPREADSHEET_ID", None)
+    if not svc or not sid:
+        raise RuntimeError(
+            "Google Sheets er ikke konfigureret: Mangler gcp_service_account og/eller SPREADSHEET_ID i Secrets."
+        )
+
+    creds = Credentials.from_service_account_info(svc, scopes=GSPREAD_SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(sid)
+    return client, sheet
 
 def _ensure_ws(name: str, header: List[str]):
     _, sh = _get_gspread()
@@ -103,15 +102,15 @@ def _ensure_ws(name: str, header: List[str]):
         ws.update([header])
         return ws
     # Sikr header
-    current = ws.get_values("A1:Z1")
-    if not current or (current and (current[0] != header)):
+    row1 = ws.get_values("A1:Z1")
+    current = row1[0] if row1 else []
+    if current != header:
         ws.clear()
         ws.update([header])
     return ws
 
 def _df_to_ws(name: str, df: pd.DataFrame, header: List[str]):
     ws = _ensure_ws(name, header)
-    # Række-data
     values = [header]
     if not df.empty:
         values += df[header].astype(str).values.tolist()
@@ -121,13 +120,10 @@ def _df_to_ws(name: str, df: pd.DataFrame, header: List[str]):
 def _ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
     ws = _ensure_ws(name, header)
     values = ws.get_all_values()
-    if not values:
+    if not values or len(values) == 1:
         return pd.DataFrame(columns=header)
-    rows = values[1:]  # skip header
-    if not rows:
-        return pd.DataFrame(columns=header)
-    out = pd.DataFrame(rows, columns=header)
-    # forsøg at konvertere typer
+    out = pd.DataFrame(values[1:], columns=header)
+    # Typer
     for col in out.columns:
         if col in ("votes",):
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
@@ -135,10 +131,10 @@ def _ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
 
-# ---------- Storage API (Sheets eller lokale filer) ----------
+# ---------- Storage API ----------
 def ensure_storage():
     if USE_SHEETS:
-        _ensure_ws("predictions", ["participant","category","Vinder","Runnerup","Loooser","submitted_at"])
+        _ensure_ws("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
         _ensure_ws("snapshots",   ["batch_id","timestamp","category","nominee","votes"])
         _ensure_ws("jury",        ["category","nominee","jury_pct","updated_at"])
         _ensure_ws("nominees",    ["category","nominee"])
@@ -148,7 +144,7 @@ def ensure_storage():
             with open(NOMINEES_JSON, "w", encoding="utf-8") as f:
                 json.dump({cat: [] for cat in CATEGORIES}, f, ensure_ascii=False, indent=2)
         if not os.path.exists(PREDICTIONS_CSV):
-            pd.DataFrame(columns=["participant","category","Vinder","Runnerup","Loooser","submitted_at"]).to_csv(PREDICTIONS_CSV, index=False)
+            pd.DataFrame(columns=["participant","category","pick1","pick2","pick3","submitted_at"]).to_csv(PREDICTIONS_CSV, index=False)
         if not os.path.exists(SNAPSHOTS_CSV):
             pd.DataFrame(columns=["batch_id","timestamp","category","nominee","votes"]).to_csv(SNAPSHOTS_CSV, index=False)
         if not os.path.exists(JURY_CSV):
@@ -158,11 +154,8 @@ def load_nominees() -> Dict[str, List[str]]:
     if USE_SHEETS:
         df = _ws_to_df("nominees", ["category","nominee"])
         out = {cat: [] for cat in CATEGORIES}
-        if df.empty:
-            return out
         for cat in CATEGORIES:
-            names = df[df["category"] == cat]["nominee"].dropna().tolist()
-            out[cat] = names
+            out[cat] = df[df["category"] == cat]["nominee"].dropna().tolist()
         return out
     else:
         with open(NOMINEES_JSON, "r", encoding="utf-8") as f:
@@ -182,15 +175,15 @@ def save_nominees(nominees: Dict[str, List[str]]):
 
 def read_predictions() -> pd.DataFrame:
     if USE_SHEETS:
-        return _ws_to_df("predictions", ["participant","category","Vinder","Runnerup","Loooser","submitted_at"])
+        return _ws_to_df("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
     else:
         if os.path.exists(PREDICTIONS_CSV):
             return pd.read_csv(PREDICTIONS_CSV)
-        return pd.DataFrame(columns=["participant","category","Vinder","Runnerup","Loooser","submitted_at"])
+        return pd.DataFrame(columns=["participant","category","pick1","pick2","pick3","submitted_at"])
 
 def write_predictions(df: pd.DataFrame):
     if USE_SHEETS:
-        _df_to_ws("predictions", df, ["participant","category","Vinder","Runnerup","Loooser","submitted_at"])
+        _df_to_ws("predictions", df, ["participant","category","pick1","pick2","pick3","submitted_at"])
     else:
         df.to_csv(PREDICTIONS_CSV, index=False)
 
@@ -212,7 +205,6 @@ def write_snapshots(df: pd.DataFrame):
     if not df.empty:
         df = df.sort_values(["timestamp","batch_id"], ascending=[False, False])
     if USE_SHEETS:
-        # skriv som strings
         tmp = df.copy()
         if "timestamp" in tmp.columns:
             tmp["timestamp"] = tmp["timestamp"].astype(str)
@@ -240,20 +232,10 @@ def current_table_from_snapshots(snapshots: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["category","nominee","votes"])
     snapshots = snapshots.sort_values(["timestamp"]).copy()
     latest = (
-        snapshots
-        .groupby("category")["timestamp"]
-        .max()
-        .reset_index()
-        .rename(columns={"timestamp": "latest_timestamp"})
+        snapshots.groupby("category")["timestamp"].max().reset_index().rename(columns={"timestamp":"latest_timestamp"})
     )
-    merged = snapshots.merge(
-        latest,
-        left_on=["category","timestamp"],
-        right_on=["category","latest_timestamp"],
-        how="inner"
-    )
-    cur = merged[["category","nominee","votes"]]
-    return cur
+    merged = snapshots.merge(latest, left_on=["category","timestamp"], right_on=["category","latest_timestamp"], how="inner")
+    return merged[["category","nominee","votes"]]
 
 def public_pct_from_current(cur_votes: pd.DataFrame) -> pd.DataFrame:
     if cur_votes.empty:
@@ -286,17 +268,14 @@ def ranking_per_category_combined(combined_df: pd.DataFrame) -> Dict[str, List[s
 
 def compute_potential_points(preds: pd.DataFrame, ranks: Dict[str, List[str]]) -> pd.DataFrame:
     if preds.empty:
-        return pd.DataFrame(columns=["participant","category","Vinder","Runnerup","Loooser","potential_points"])
+        return pd.DataFrame(columns=["participant","category","pick1","pick2","pick3","potential_points"])
 
     def row_points(row) -> int:
         top = ranks.get(row["category"], [])
         pts = 0
-        if len(top) >= 1 and row["Vinder"] == top[0]:
-            pts += 5
-        if len(top) >= 2 and row["Runnerup"] == top[1]:
-            pts += 1
-        if len(top) >= 3 and row["Loooser"] == top[2]:
-            pts += 1
+        if len(top) >= 1 and row["pick1"] == top[0]: pts += 5
+        if len(top) >= 2 and row["pick2"] == top[1]: pts += 1
+        if len(top) >= 3 and row["pick3"] == top[2]: pts += 1
         return pts
 
     out = preds.copy()
@@ -355,7 +334,6 @@ def section_status_overview(snapshots: pd.DataFrame):
                 "public_pct": "Offentlig %",
                 "combined_pct": "Samlet % (60/40)"
             }).copy()
-
             for col in ["Jury %","Offentlig %","Samlet % (60/40)"]:
                 display[col] = display[col].map(lambda x: round(float(x), 2))
 
@@ -422,9 +400,9 @@ def section_submit_predictions(nominees: Dict[str, List[str]]):
             rows.append({
                 "participant": participant,
                 "category": cat,
-                "Vinder": p1,
-                "Runnerup": p2,
-                "Loooser": p3,
+                "pick1": p1,
+                "pick2": p2,
+                "pick3": p3,
                 "submitted_at": now,
             })
 
@@ -490,7 +468,7 @@ def section_admin(nominees: Dict[str, List[str]]):
 
     # Jury
     st.subheader("Jury-procenter pr. kategori (vægt 60%)")
-    st.caption("Angiv juryens procentfordeling pr. kategori. Summerer ideelt til 100% per kategori.")
+    st.caption("Angiv juryens procentfordeling pr. kategori. Summerer ideelt til ~100% per kategori.")
     jury_df = read_jury()
     if jury_df.empty:
         jury_df = pd.DataFrame(columns=["category","nominee","jury_pct","updated_at"])
@@ -580,6 +558,32 @@ def section_admin(nominees: Dict[str, List[str]]):
 
     st.divider()
 
+    # 🔌 Sundhedstjek – Google Sheets
+    with st.expander("🔌 Sundhedstjek – Google Sheets"):
+        st.write("Lagring valgt:", "Google Sheets" if USE_SHEETS else "Lokale filer")
+        st.write("SPREADSHEET_ID:", st.secrets.get("SPREADSHEET_ID", None))
+        has_svc = st.secrets.get("gcp_service_account", None) is not None
+        st.write("Service account i Secrets:", "✅" if has_svc else "❌")
+
+        if st.button("Kør tjek nu"):
+            try:
+                client, sh = _get_gspread()  # rejser RuntimeError hvis misconfig
+                st.success(f"Forbundet til Google Sheets: {sh.title}")
+                ws = _ensure_ws("nominees", ["category","nominee"])
+                rows_before = len(ws.get_all_values())
+                marker = "DIAG_" + datetime.now().strftime("%H%M%S")
+                ws.append_row(["__diagnostic__", marker], value_input_option="RAW")
+                rows_after = len(ws.get_all_values())
+                ws.delete_rows(rows_after)
+                st.success("Skriv/læs OK ✅ (test-række skrevet og fjernet)")
+                st.write(f"Rækker før: {rows_before}, efter: {rows_after}")
+            except Exception as e:
+                st.error("Google Sheets-fejl – kunne ikke læse/skrive.")
+                st.exception(e)
+                st.info("Tjek: deling (Editor), SPREADSHEET_ID i Secrets, og private_key i triple quotes.")
+
+    st.divider()
+
     # Nulstil gæt
     st.subheader("Nulstil deltager-gæt (administrativt)")
     preds = read_predictions()
@@ -593,34 +597,6 @@ def section_admin(nominees: Dict[str, List[str]]):
             st.success(f"Gæt for {who} er nulstillet.")
 
     st.divider()
-with st.expander("🔌 Sundhedstjek – Google Sheets"):
-    st.write("SPREADSHEET_ID:", _secret("SPREADSHEET_ID"))
-    has_svc = False
-    try:
-        _ = st.secrets["gcp_service_account"]
-        has_svc = True
-    except Exception:
-        pass
-    st.write("Service account i Secrets:", "✅" if has_svc else "❌")
-
-    if st.button("Kør tjek nu"):
-        try:
-            client, sh = _get_gspread()
-            st.success(f"Forbundet til Google Sheets: {sh.title}")
-            ws = _ensure_ws("nominees", ["category","nominee"])
-            rows_before = len(ws.get_all_values())
-            # Skriv en test-række og slet den igen
-            marker = "DIAG_" + datetime.now().strftime("%H%M%S")
-            ws.append_row(["__diagnostic__", marker], value_input_option="RAW")
-            rows_after = len(ws.get_all_values())
-            st.write("Rækker før:", rows_before, "Rækker efter:", rows_after)
-            # slet sidste række igen
-            ws.delete_rows(rows_after)
-            st.success("Skriv/læs OK ✅ (test-række skrevet og fjernet)")
-        except Exception as e:
-            st.error("Google Sheets-fejl – kunne ikke læse/skrive.")
-            st.exception(e)
-            st.info("Tjek: deling (Editor), SPREADSHEET_ID, og at private_key står med triple quotes i Secrets.")
 
     # Eksport
     st.subheader("Eksport")
@@ -664,4 +640,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
