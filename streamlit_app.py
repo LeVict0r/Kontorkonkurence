@@ -3,15 +3,18 @@
 # Erhvervskulturpriserne 2025 – Kontorspil
 # Persistent storage: Google Sheets (hvis konfigureret) ellers lokale filer
 # Jury (60%) + Offentlig (40%), historik, predictions & leaderboard
+# Rate-limit venlig: caching + backoff + minimal init
 # ---------------------------------------------------------------
 
 import os
 import json
+import time
 from datetime import datetime, date
 from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+from gspread.exceptions import APIError  # til backoff
 
 # (Valgfrit) brug .env lokalt
 try:
@@ -31,7 +34,11 @@ NOMINEES_JSON  = os.path.join(DATA_DIR, "nominees.json")
 JURY_CSV       = os.path.join(DATA_DIR, "jury.csv")
 CONFIG_JSON    = os.path.join(DATA_DIR, "config.json")  # her kan vi gemme SPREADSHEET_ID via UI
 
-GSPREAD_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Vigtige scopes (inkl. Drive for delte drev mv.)
+GSPREAD_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 CATEGORIES: List[str] = [
     "Årets Leder",
@@ -83,6 +90,38 @@ def _write_config(d: Dict[str, str]) -> None:
     with open(CONFIG_JSON, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
+# ---------- Helper: Backoff på gspread-kald ----------
+def _with_backoff(call, *args, **kwargs):
+    """
+    Kør et gspread-opkald med eksponentiel backoff ved 429/Quota-rate limit.
+    """
+    delays = [0.3, 0.8, 1.5, 2.5, 4.0]  # sekunder
+    last_err = None
+    for d in delays:
+        try:
+            return call(*args, **kwargs)
+        except APIError as e:
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg or "rate" in msg:
+                last_err = e
+                time.sleep(d)
+                continue
+            raise
+    # sidste forsøg uden ekstra sleep
+    return call(*args, **kwargs)
+
+# ---------- Normalisering af Sheet ID ----------
+def _normalize_sheet_id(s: Optional[str]) -> Optional[str]:
+    """Accepter både ren ID og hele URL’er – returnér ren ID eller None."""
+    if not s:
+        return None
+    sid = str(s).strip()
+    if sid.startswith("http"):
+        import re
+        m = re.search(r"/d/([a-zA-Z0-9-_]+)", sid)
+        return m.group(1) if m else None
+    return sid
+
 # ---------- Google Sheets: robust ID-hentning ----------
 def _resolve_spreadsheet_id_with_source() -> Tuple[Optional[str], str]:
     """
@@ -97,19 +136,19 @@ def _resolve_spreadsheet_id_with_source() -> Tuple[Optional[str], str]:
     # 1) session override
     sid = st.session_state.get("SPREADSHEET_ID_OVERRIDE")
     if sid:
-        return sid.strip(), "session_state"
+        return _normalize_sheet_id(sid), "session_state"
 
     # 2) lokal config
     cfg = _read_config()
     sid = cfg.get("SPREADSHEET_ID")
     if sid:
-        return sid.strip(), "config.json"
+        return _normalize_sheet_id(sid), "config.json"
 
     # 3) secrets topniveau
     try:
         sid = st.secrets.get("SPREADSHEET_ID", None)
         if sid:
-            return str(sid).strip(), "secrets_top"
+            return _normalize_sheet_id(sid), "secrets_top"
     except Exception:
         pass
 
@@ -119,14 +158,14 @@ def _resolve_spreadsheet_id_with_source() -> Tuple[Optional[str], str]:
         if isinstance(svc, dict):
             sid = svc.get("SPREADSHEET_ID", None)
             if sid:
-                return str(sid).strip(), "secrets_gcp_block"
+                return _normalize_sheet_id(sid), "secrets_gcp_block"
     except Exception:
         pass
 
     # 5) miljøvariabel
     sid = os.environ.get("SPREADSHEET_ID")
     if sid:
-        return sid.strip(), "env"
+        return _normalize_sheet_id(sid), "env"
 
     return None, "none"
 
@@ -146,42 +185,43 @@ def use_sheets() -> bool:
     """Kald denne i stedet for en global konstant, så vi kan skifte on-the-fly."""
     return _sheets_available()
 
-# ---------- Google Sheets helpers ----------
-def _get_gspread() -> Tuple["gspread.client.Client", "gspread.Spreadsheet"]:
+# ---------- Google Sheets klient (cachet) ----------
+@st.cache_resource(show_spinner=False)
+def _gspread_client_cached():
     import gspread
     from google.oauth2.service_account import Credentials
-
-    try:
-        svc = st.secrets.get("gcp_service_account", None)
-    except Exception:
-        svc = None
-
-    sid = _get_spreadsheet_id()
-
+    svc = st.secrets.get("gcp_service_account", None)
     if not svc:
-        raise RuntimeError("Google Sheets er ikke konfigureret: mangler [gcp_service_account] i Secrets.")
-    if not sid:
-        raise RuntimeError("Google Sheets er ikke konfigureret: mangler SPREADSHEET_ID i Secrets/UI (toplevel, i gcp_service_account, config.json eller session).")
-
+        raise RuntimeError("Mangler [gcp_service_account] i Secrets.")
     creds = Credentials.from_service_account_info(svc, scopes=GSPREAD_SCOPES)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(str(sid))
+    return gspread.authorize(creds)
+
+def _get_gspread() -> Tuple["gspread.client.Client", "gspread.Spreadsheet"]:
+    client = _gspread_client_cached()
+    sid = _get_spreadsheet_id()
+    if not sid:
+        raise RuntimeError("Google Sheets er ikke konfigureret: mangler et gyldigt SPREADSHEET_ID (UI/Secrets/ENV).")
+    sheet = _with_backoff(client.open_by_key, _normalize_sheet_id(sid))
     return client, sheet
 
+# ---------- Worksheet helpers ----------
 def _ensure_ws(name: str, header: List[str]):
     _, sh = _get_gspread()
     try:
-        ws = sh.worksheet(name)
+        ws = _with_backoff(sh.worksheet, name)
     except Exception:
-        ws = sh.add_worksheet(title=name, rows="100", cols=str(max(10, len(header))))
-        ws.update([header])
+        ws = _with_backoff(sh.add_worksheet, title=name, rows="100", cols=str(max(10, len(header))))
+        _with_backoff(ws.update, [header])
         return ws
-    # Sikr header
-    row1 = ws.get_values("A1:Z1")
-    current = row1[0] if row1 else []
-    if current != header:
-        ws.clear()
-        ws.update([header])
+    # Sikr header (tjek kun én gang pr. session for at spare reads)
+    session_key = f"_ws_header_checked_{name}"
+    if not st.session_state.get(session_key, False):
+        row1 = _with_backoff(ws.get_values, "A1:Z1")
+        current = row1[0] if row1 else []
+        if current != header:
+            _with_backoff(ws.clear)
+            _with_backoff(ws.update, [header])
+        st.session_state[session_key] = True
     return ws
 
 def _df_to_ws(name: str, df: pd.DataFrame, header: List[str]):
@@ -189,12 +229,12 @@ def _df_to_ws(name: str, df: pd.DataFrame, header: List[str]):
     values = [header]
     if not df.empty:
         values += df[header].astype(str).values.tolist()
-    ws.clear()
-    ws.update(values)
+    _with_backoff(ws.clear)
+    _with_backoff(ws.update, values)
 
 def _ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
     ws = _ensure_ws(name, header)
-    values = ws.get_all_values()
+    values = _with_backoff(ws.get_all_values)
     if not values or len(values) == 1:
         return pd.DataFrame(columns=header)
     out = pd.DataFrame(values[1:], columns=header)
@@ -205,6 +245,11 @@ def _ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
         elif col in ("jury_pct", "public_pct", "combined_pct"):
             out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
+
+# Cache læsninger kort, for at undgå 429 (rydder vi efter skriv)
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_ws_to_df(name: str, header: List[str]) -> pd.DataFrame:
+    return _ws_to_df(name, header)
 
 # ---------- Storage API ----------
 def ensure_storage():
@@ -225,9 +270,20 @@ def ensure_storage():
         if not os.path.exists(JURY_CSV):
             pd.DataFrame(columns=["category","nominee","jury_pct","updated_at"]).to_csv(JURY_CSV, index=False)
 
+def ensure_storage_once():
+    """
+    Kør worksheet-initialisering kun én gang pr. session (spar læsninger).
+    """
+    if use_sheets():
+        if not st.session_state.get("_ws_ready", False):
+            ensure_storage()
+            st.session_state["_ws_ready"] = True
+    else:
+        ensure_storage()
+
 def load_nominees() -> Dict[str, List[str]]:
     if use_sheets():
-        df = _ws_to_df("nominees", ["category","nominee"])
+        df = _cached_ws_to_df("nominees", ["category","nominee"])
         out = {cat: [] for cat in CATEGORIES}
         for cat in CATEGORIES:
             out[cat] = df[df["category"] == cat]["nominee"].dropna().tolist()
@@ -244,13 +300,14 @@ def save_nominees(nominees: Dict[str, List[str]]):
                 rows.append({"category": cat, "nominee": nom})
         df = pd.DataFrame(rows, columns=["category","nominee"])
         _df_to_ws("nominees", df, ["category","nominee"])
+        st.cache_data.clear()
     else:
         with open(NOMINEES_JSON, "w", encoding="utf-8") as f:
             json.dump(nominees, f, ensure_ascii=False, indent=2)
 
 def read_predictions() -> pd.DataFrame:
     if use_sheets():
-        return _ws_to_df("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
+        return _cached_ws_to_df("predictions", ["participant","category","pick1","pick2","pick3","submitted_at"])
     else:
         if os.path.exists(PREDICTIONS_CSV):
             return pd.read_csv(PREDICTIONS_CSV)
@@ -259,12 +316,13 @@ def read_predictions() -> pd.DataFrame:
 def write_predictions(df: pd.DataFrame):
     if use_sheets():
         _df_to_ws("predictions", df, ["participant","category","pick1","pick2","pick3","submitted_at"])
+        st.cache_data.clear()
     else:
         df.to_csv(PREDICTIONS_CSV, index=False)
 
 def read_snapshots() -> pd.DataFrame:
     if use_sheets():
-        df = _ws_to_df("snapshots", ["batch_id","timestamp","category","nominee","votes"])
+        df = _cached_ws_to_df("snapshots", ["batch_id","timestamp","category","nominee","votes"])
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         return df
@@ -284,12 +342,13 @@ def write_snapshots(df: pd.DataFrame):
         if "timestamp" in tmp.columns:
             tmp["timestamp"] = tmp["timestamp"].astype(str)
         _df_to_ws("snapshots", tmp, ["batch_id","timestamp","category","nominee","votes"])
+        st.cache_data.clear()
     else:
         df.to_csv(SNAPSHOTS_CSV, index=False)
 
 def read_jury() -> pd.DataFrame:
     if use_sheets():
-        return _ws_to_df("jury", ["category","nominee","jury_pct","updated_at"])
+        return _cached_ws_to_df("jury", ["category","nominee","jury_pct","updated_at"])
     else:
         if os.path.exists(JURY_CSV):
             return pd.read_csv(JURY_CSV)
@@ -298,6 +357,7 @@ def read_jury() -> pd.DataFrame:
 def write_jury(df: pd.DataFrame):
     if use_sheets():
         _df_to_ws("jury", df, ["category","nominee","jury_pct","updated_at"])
+        st.cache_data.clear()
     else:
         df.to_csv(JURY_CSV, index=False)
 
@@ -518,14 +578,16 @@ def section_admin(nominees: Dict[str, List[str]]):
         sid, src = _resolve_spreadsheet_id_with_source()
         st.write("Aktuel SPREADSHEET_ID:", sid or "None")
         st.write("Kilde:", src)
+        if sid:
+            st.write("Åbn direkte:", f"https://docs.google.com/spreadsheets/d/{sid}/edit")
         new_sid = st.text_input("Angiv/ret Google Sheet ID", value=sid or "", help="Selve ID'et fra URL'en mellem /d/ og /edit")
-        colA, colB = st.columns(2)
+        colA, colB, colC = st.columns(3)
         with colA:
             if st.button("Gem ID til config.json"):
                 cfg = _read_config()
-                cfg["SPREADSHEET_ID"] = new_sid.strip()
+                cfg["SPREADSHEET_ID"] = _normalize_sheet_id(new_sid) or ""
                 _write_config(cfg)
-                st.session_state["SPREADSHEET_ID_OVERRIDE"] = new_sid.strip()
+                st.session_state["SPREADSHEET_ID_OVERRIDE"] = cfg["SPREADSHEET_ID"]
                 st.success("SPREADSHEET_ID gemt lokalt og aktiveret for denne session.")
         with colB:
             if st.button("Ryd lokalt ID"):
@@ -535,8 +597,11 @@ def section_admin(nominees: Dict[str, List[str]]):
                     _write_config(cfg)
                 st.session_state.pop("SPREADSHEET_ID_OVERRIDE", None)
                 st.success("Lokalt ID ryddet. Appen vil nu bruge Secrets eller ENV hvis tilgængeligt.")
-
-        st.caption("Tip: Når ID'et er sat her, kan du bruge Sheets med det samme – selv hvis Secrets driller.")
+        with colC:
+            if st.button("Initialiser ark (opret faner & headers)"):
+                ensure_storage()
+                st.session_state["_ws_ready"] = True
+                st.success("Ark initialiseret.")
 
     # Kandidater
     st.subheader("Kandidater pr. kategori")
@@ -666,17 +731,19 @@ def section_admin(nominees: Dict[str, List[str]]):
         st.write("Kilde:", src)
         has_svc = st.secrets.get("gcp_service_account", None) is not None
         st.write("Service account i Secrets:", "✅" if has_svc else "❌")
+        if sid:
+            st.write("Åbn direkte:", f"https://docs.google.com/spreadsheets/d/{sid}/edit")
 
         if st.button("Kør tjek nu"):
             try:
-                client, sh = _get_gspread()  # rejser RuntimeError hvis misconfig
+                client, sh = _get_gspread()
                 st.success(f"Forbundet til Google Sheets: {sh.title}")
                 ws = _ensure_ws("nominees", ["category","nominee"])
-                rows_before = len(ws.get_all_values())
+                rows_before = len(_with_backoff(ws.get_all_values))
                 marker = "DIAG_" + datetime.now().strftime("%H%M%S")
-                ws.append_row(["__diagnostic__", marker], value_input_option="RAW")
-                rows_after = len(ws.get_all_values())
-                ws.delete_rows(rows_after)
+                _with_backoff(ws.append_row, ["__diagnostic__", marker], value_input_option="RAW")
+                rows_after = len(_with_backoff(ws.get_all_values))
+                _with_backoff(ws.delete_rows, rows_after)
                 st.success("Skriv/læs OK ✅ (test-række skrevet og fjernet)")
                 st.write(f"Rækker før: {rows_before}, efter: {rows_after}")
             except Exception as e:
@@ -710,7 +777,7 @@ def section_admin(nominees: Dict[str, List[str]]):
 # ---------- Hovedapp ----------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    ensure_storage()
+    ensure_storage_once()  # kør kun init én gang pr. session (spar Google-reads)
     st.title(APP_TITLE)
     st.caption(f"Lagring: {'Google Sheets' if use_sheets() else 'Lokale filer'}")
 
